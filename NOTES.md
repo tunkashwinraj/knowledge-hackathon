@@ -3,17 +3,26 @@
 ## Requirements
 
 - Python 3.9 or newer (tested on 3.11), plus `pip install -r requirements.txt`. The only dependency is `anthropic==0.121.0`.
-- An **`ANTHROPIC_API_KEY` environment variable is required.** This is a paid Claude API.
+- An **`ANTHROPIC_API_KEY` environment variable is required.** This is a paid Claude API. **Nothing else needs to be set.**
   - Claude writes every member-facing answer.
-  - Model: **`claude-opus-5-5` in fast mode** (`speed: "fast"`), `low` effort, with the server-side refusal fallback enabled.
-  - If fast mode is rate-limited or not enabled for the key, each call automatically retries at standard speed. That keeps the same accuracy, but answers take about 2 s instead of about 1 s.
+  - Model: **`claude-opus-5-5` in fast mode** (`speed: "fast"`), `low` effort, with the server-side refusal fallback enabled. Fast mode is **on by default**.
+  - **Automatic step-down** if the key cannot use a feature. It is discovered by a warm-up call during ingest (untimed) and remembered for the run:
+    - Fast mode unavailable: use standard speed.
+    - Refusal-fallback beta unavailable: turn it off.
+    - Opus 5.5 unavailable: use Sonnet 5.5, then Haiku 5.5.
+    - Fast mode rate-limited: that one call goes at standard speed.
+  - Measured on the practice set:
+    - Fast mode on: accuracy 0.969, p95 1.55 s.
+    - Fast mode off: the same accuracy, 0.969, but p95 3.5 s.
+    - Sonnet fallback: accuracy about 0.94–0.96.
+    - `python dev/test_fallbacks.py` tests the step-down offline.
   - Without a key, the system still runs: ingest and `conflicts()` are fully local, and every `answer()` returns a polite "please contact us". Accuracy is then near zero.
 - Approximate cost (fast mode is billed at $8 / $40 per million tokens):
   - About 6–12k input tokens per question (the 2k-token system prompt is cached) and 100–300 output tokens.
   - That is roughly **$0.06 per question**, or about $2.5 per 40-question run.
 - Optional settings:
   - `KB_MODEL` (default `claude-opus-5-5`)
-  - `KB_FAST=1|0` (default `1`)
+  - `KB_FAST=1|0` (default `1`, on; set `0` only to save cost)
   - `KB_EFFORT` (default `low`)
   - `KB_TIMEOUT` (seconds per API call, default 20)
   - `KB_HEDGE_AFTER` (default 3.0 s; a duplicate request is sent if the first has not answered by then)

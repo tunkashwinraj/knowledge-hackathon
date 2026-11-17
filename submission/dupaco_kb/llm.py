@@ -5,8 +5,10 @@ import concurrent.futures as cf
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
+MODEL_CHAIN = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]   # step-down order if unavailable
 _POOL = cf.ThreadPoolExecutor(max_workers=8, thread_name_prefix="kb-llm")
 HEDGE_AFTER = float(os.getenv("KB_HEDGE_AFTER", "3.0"))   # seconds before a duplicate request is sent
 
@@ -90,6 +92,9 @@ class LLM:
                   file=sys.stderr)
         # the harness allows 60 s per answer: keep every call well inside that budget
         self.client = anthropic.Anthropic(timeout=float(os.getenv("KB_TIMEOUT", "20")), max_retries=1)
+        self.use_fast = os.getenv("KB_FAST", "1") == "1"      # ON unless explicitly switched off
+        self.use_fallbacks = True
+        self._lock = threading.Lock()
 
     def _kwargs(self) -> dict:
         kw = {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}}
@@ -125,25 +130,55 @@ class LLM:
                 error = f.exception()
         raise error
 
-    def _call(self, messages: list[dict]) -> dict:
-        kw = self._kwargs()
-        fast = os.getenv("KB_FAST", "1") == "1" and "opus-5-5" in self.model
+    def _request(self, messages: list[dict], allow_fast: bool = True):
         req = dict(model=self.model, max_tokens=2000,
                    system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-                   messages=messages, **kw)
+                   messages=messages, **self._kwargs())
         body, headers = {}, {}
-        if "opus-5-5" in self.model or "sonnet-5-5" in self.model:
+        if self.use_fallbacks and ("opus-5-5" in self.model or "sonnet-5-5" in self.model):
             # server-side refusal fallback: a declined request is retried on a fallback model
             body["fallbacks"] = "default"
             headers["anthropic-beta"] = "server-side-fallback-2026-07-01"
-        if fast:
+        if allow_fast and self.use_fast and "opus-5-5" in self.model:
+            # fast mode (Opus 5.5) is the top-level "speed" field; this SDK version has no named argument for it
+            body["speed"] = "fast"
+        return req, body, headers
+
+    def _degrade(self, err) -> bool:
+        """The key/account cannot use a requested feature (400/403/404): step down once, for the
+        rest of the run - fast mode, then the refusal-fallback beta, then a smaller model."""
+        with self._lock:
+            if self.use_fast and "opus-5-5" in self.model:
+                self.use_fast, what = False, "fast mode unavailable -> standard speed"
+            elif self.use_fallbacks:
+                self.use_fallbacks, what = False, "refusal fallback unavailable -> off"
+            elif self.model in MODEL_CHAIN and MODEL_CHAIN.index(self.model) + 1 < len(MODEL_CHAIN):
+                old = self.model
+                self.model = MODEL_CHAIN[MODEL_CHAIN.index(self.model) + 1]
+                what = f"model {old} unavailable -> {self.model}"
+            else:
+                return False
+        print(f"[kb] {what} ({type(err).__name__} {getattr(err, 'status_code', '')})", file=sys.stderr)
+        return True
+
+    def _call(self, messages: list[dict]) -> dict:
+        for _ in range(len(MODEL_CHAIN) + 3):
+            req, body, headers = self._request(messages)
             try:
-                # fast mode (Opus 5.5) is the top-level "speed" field; this SDK version has no named argument for it
-                resp = self.client.messages.create(**req, extra_body={**body, "speed": "fast"}, extra_headers=headers)
-            except (self.anthropic.RateLimitError, self.anthropic.BadRequestError):
-                resp = self.client.messages.create(**req, extra_body=body, extra_headers=headers)  # standard speed
+                resp = self.client.messages.create(**req, extra_body=body or None, extra_headers=headers or None)
+                break
+            except self.anthropic.RateLimitError:
+                if "speed" not in body:
+                    raise
+                # fast mode has its own capacity limit: answer this one at standard speed
+                req, body, headers = self._request(messages, allow_fast=False)
+                resp = self.client.messages.create(**req, extra_body=body or None, extra_headers=headers or None)
+                break
+            except self.anthropic.APIStatusError as e:
+                if e.status_code not in (400, 403, 404) or not self._degrade(e):
+                    raise
         else:
-            resp = self.client.messages.create(**req, extra_body=body or None, extra_headers=headers or None)
+            raise RuntimeError("no usable model configuration")
         if resp.stop_reason == "refusal":
             raise RuntimeError("model refused")
         text = next((b.text for b in resp.content if b.type == "text"), "")
