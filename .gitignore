@@ -1,0 +1,10 @@
+results/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+snapshots/0*/
+
+# supplied website snapshots and assignment material: not redistributed
+snapshots_zip/
+*.pdf
