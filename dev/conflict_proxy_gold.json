@@ -8,5 +8,12 @@
  {"id": "p7", "topic_keywords": ["10-month", "jumbo"], "values": ["3.90%", "4.00%"], "correct_value": "4.00%"},
  {"id": "p8", "topic_keywords": ["12-month", "certificate"], "values": ["2.90%", "3.40%"], "correct_value": "3.40%"},
  {"id": "p9", "topic_keywords": ["branch"], "values": ["24", "22"], "correct_value": "22"},
- {"id": "p10", "topic_keywords": ["forbes"], "values": ["fourth", "fifth"], "correct_value": "fifth"}
+ {"id": "p10", "topic_keywords": ["forbes"], "values": ["fourth", "fifth"], "correct_value": "fifth"},
+ {"id": "p11", "topic_keywords": ["30-year", "refinance"], "values": ["6.049%", "7.30%"], "correct_value": "7.30%"},
+ {"id": "p12", "topic_keywords": ["15-year", "mortgage"], "values": ["5.623%", "6.88%"], "correct_value": "6.88%"},
+ {"id": "p13", "topic_keywords": ["auto"], "values": ["6.29%", "6.34%"], "correct_value": "6.34%"},
+ {"id": "p14", "topic_keywords": ["auto"], "values": ["8.54%", "8.59%"], "correct_value": "8.59%"},
+ {"id": "p15", "topic_keywords": ["ira", "traditional"], "values": ["3.90%", "4.00%"], "correct_value": "4.00%"},
+ {"id": "p16", "topic_keywords": ["counties"], "values": ["112", "118"], "correct_value": "118"},
+ {"id": "p17", "topic_keywords": ["17-month"], "values": ["3.95%", "4.10%"], "correct_value": "4.10%"}
 ]

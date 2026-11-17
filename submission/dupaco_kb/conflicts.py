@@ -50,18 +50,26 @@ def _short(url: str) -> str:
     return (p.path or "/").rstrip("/") or "/"
 
 
+PRODUCT_SYNONYMS = {
+    "certificate": "certificate (CD, share certificate)", "ira certificate": "IRA certificate (CD)",
+    "auto loan": "auto loan (car / vehicle loan)", "mortgage": "mortgage (home loan)",
+    "checking": "checking account", "savings": "savings account", "money market": "money market account",
+    "credit card": "credit card (Visa)", "personal loan": "personal loan", "home equity": "home equity (HELOC)",
+}
+
+
 def _term_variants(quals: dict) -> str:
     out = []
     for t in quals.get("terms", ()):
         n, unit = t.split()
-        out.append(f"{n}-{unit}")
-    return " ".join(out)
+        out += [f"{n}-{unit}", f"{n} {unit}"]
+    return " / ".join(out)
 
 
 def _topic(f) -> str:
     label = re.sub(r"\s*\|\s*", ", ", f.label)
     extra = _term_variants(f.quals)
-    prod = f.product if f.product != "other" else ""
+    prod = PRODUCT_SYNONYMS.get(f.product, f.product) if f.product != "other" else ""
     return re.sub(r"\s+", " ", f"{extra} {prod} {METRIC_NAME.get(f.metric, f.metric)} - {label}").strip()
 
 
@@ -78,7 +86,9 @@ CLAIMS = [
 def prose_claims(store, sidx: int):
     found = defaultdict(list)    # claim -> [(value, version)]
     for v in store.versions:
-        if sidx not in v.snaps:
+        # only the credit union's own statements: news releases and official pages (blog articles
+        # quote other organisations' employee/county counts)
+        if sidx not in v.snaps or v.ptype not in ("newsroom", "product", "home", "landing", "rates"):
             continue
         for name, rx, page_rx in CLAIMS:
             if page_rx and not page_rx.search(v.title + " " + v.url):
@@ -87,6 +97,76 @@ def prose_claims(store, sidx: int):
             if len(vals) == 1:          # a page that itself lists several values is ambiguous
                 found[name].append((vals.pop(), v))
     return found
+
+
+SIBLINGS = [("roth", "traditional")]
+_SIBLING_PREFIX = re.compile(r"^(roth|traditional):\s*", re.I)
+
+
+def sibling_drift(store) -> list[dict]:
+    """Variant rows of one table that always carried the same value (e.g. the Roth and the
+    Traditional IRA version of a special) but now differ: one was updated, the other is a
+    leftover. The side that moved since the previous crawl is current."""
+    latest = store.latest_index()
+    snap_ids = [s for s, _ in store.snaps]
+    facts_by_vid = defaultdict(list)
+    for f in store.facts:
+        if not f.ambiguous:
+            facts_by_vid[f.vid].append(f)
+
+    def previous(f):
+        hist = [store.versions[v] for v in store.by_url.get(f.url, [])]
+        prev = [v for v in hist if v.snaps and min(v.snaps) < latest and v.vid != f.vid]
+        if not prev:
+            return None
+        pv = max(prev, key=lambda v: max(s for s in v.snaps if s < latest) if any(s < latest for s in v.snaps) else -1)
+        for g in facts_by_vid[pv.vid]:
+            if norm_text(g.label) == norm_text(f.label) and g.metric == f.metric:
+                return g.value
+        return None
+
+    found = {}
+    for vid, facts in facts_by_vid.items():
+        if latest not in store.versions[vid].snaps:
+            continue
+        for i, a in enumerate(facts):
+            for b in facts[i + 1:]:
+                if a.product != b.product or a.metric != b.metric or a.value == b.value:
+                    continue
+                qa, qb = a.quals, b.quals
+                if (qa["terms"], qa["amount"], qa["band"], qa["groups"]) != \
+                        (qb["terms"], qb["amount"], qb["band"], qb["groups"]):
+                    continue
+                diff = set(qa["strict"]) ^ set(qb["strict"])
+                pair = next((p for p in SIBLINGS if set(p) == diff), None)
+                if not pair:
+                    continue
+                pa, pb = previous(a), previous(b)
+                if pa is None or pb is None or pa != pb:
+                    continue              # they did not agree before: not a drift
+                if a.value != pa and b.value == pb:
+                    cur, old = a, b
+                elif b.value != pb and a.value == pa:
+                    cur, old = b, a
+                else:
+                    continue
+                common = tuple(sorted(set(qa["strict"]) - set(pair)))
+                key = (a.product, a.metric, qa["terms"], qa["amount"], common, old.value, cur.value)
+                side = lambda f: next(w for w in pair if w in f.quals["strict"]).title()
+                stem = _SIBLING_PREFIX.sub("", cur.label.split(": ", 1)[-1])
+                item = found.setdefault(key, {
+                    "topic": f"{_term_variants(cur.quals)} {PRODUCT_SYNONYMS.get(cur.product, cur.product)} "
+                             f"{METRIC_NAME.get(cur.metric, cur.metric)} - {side(old)} vs {side(cur)}: {stem}",
+                    "values": [old.value_str, cur.value_str], "sources": [],
+                    "resolution": f"{cur.value_str} {METRIC_NAME.get(cur.metric, cur.metric)}",
+                    "reason": (f"The {side(old)} and {side(cur)} versions always showed the same value; in the latest "
+                               f"crawl only {side(cur)} moved to {cur.value_str}, while {side(old)} still shows the "
+                               f"earlier {old.value_str} (a leftover)."),
+                    "_score": 20, "_row": ("sibling", key[0]) + key[2:5], "_metric": cur.metric})
+                for f in (old, cur):
+                    item["sources"].append({"url": f.url, "snapshot_id": snap_ids[latest],
+                                            "quote": f"{f.label}: {f.value_str}"})
+    return list(found.values())
 
 
 _METRIC_ORDER = {"APY": 0, "APR": 0, "RATE": 1, "DIV": 2}
@@ -184,6 +264,7 @@ def build_conflicts(store, max_items: int = 400) -> list[dict]:
                         "resolution": f"{w.value_str} {METRIC_NAME.get(w.metric, w.metric)}",
                         "reason": reason, "_score": score, "_row": (w.product, repr(sorted(w.quals.items()))),
                         "_metric": w.metric})
+    out += sibling_drift(store)
     out = _merge_metrics(out)
 
     # 2. prose claims (latest snapshot), most recent dated page wins
@@ -206,5 +287,24 @@ def build_conflicts(store, max_items: int = 400) -> list[dict]:
                     "reason": f"most recent page ({_short(best_v.url)}, {best_v.pub_date or best_v.fetched}) says "
                               f"{best_val}; older pages still say {', '.join(values[:-1])}", "_score": 50})
 
-    out.sort(key=lambda x: -x["_score"])
-    return out[:max_items]
+    return _dedupe(out)[:max_items]
+
+
+def _dedupe(items: list[dict]) -> list[dict]:
+    """The same change is often repeated for the IRA and business copies of a product (same values).
+    Report it once, preferring the plain personal product, and list plain products first."""
+    def penalty(it):
+        # plain personal products first; variants (business, IRA, jumbo, refinance) after them,
+        # so a value shared by two rows is paired with the more common reading
+        t = it["topic"].lower()
+        return (2 if "business" in t else 0) + (1 if "ira" in t and "vs" not in t else 0) + \
+            (1 if "jumbo" in t and "vs" not in t else 0) + (1 if "refinance" in t else 0)
+    items = sorted(items, key=lambda it: (-(it["_score"] >= 50), penalty(it), -it["_score"]))
+    seen, out = set(), []
+    for it in items:
+        sig = (it.get("_row", ("",))[0] == "sibling", tuple(sorted(it["values"])))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(it)
+    return out
